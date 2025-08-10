@@ -48,7 +48,8 @@ DEFAULT_KEYS = {
     "pickup": "K_e", "inventory": "K_i", "drop": "K_g", "use": "K_u",
     "chat": "K_RETURN", "hud_toggle": "K_F1", "options": "K_F10",
     "spell_1": "K_1", "spell_2": "K_2", "spell_3": "K_3", "spell_4": "K_4",
-    "stats": "K_p", "equipment": "K_c", "map": "K_m"
+    "stats": "K_p", "equipment": "K_c", "map": "K_m",
+    "paint_toggle": "K_F9"
 }
 CONFIG_PATH = "config.json"
 def load_config():
@@ -93,6 +94,11 @@ tooltip = {"txt": None, "until": 0.0, "pos": (0,0)}
 # ---- UI / Auth ----
 UI_STATE = "login"  # login | select | create | game
 
+# Panneaux additionnels
+MERCHANT_UI = {"open": False, "name": "", "merchant_id": None, "stock": [], "sel": 0, "msg": ""}
+QUEST_UI = {"open": False, "list": [], "sel": 0}
+PAINTER_UI = {"open": False, "tile": 0}
+
 login_mode = "login"  # login | register
 login_username = ""
 login_password = ""
@@ -111,6 +117,7 @@ create_msg = ""
 def network_thread(sock):
     global your_id, TILE, GRID_W, GRID_H, inventory, SPELLS
     global UI_STATE, char_list, char_sel, login_msg, char_msg, create_msg
+    global MERCHANT_UI, QUEST_UI, PAINTER_UI
     try:
         f = sock.makefile("r")
         for line in f:
@@ -121,7 +128,7 @@ def network_thread(sock):
                 your_id = data.get("your_id")
                 TILE = int(data.get("tile", TILE)); GRID_W = int(data.get("grid_w", GRID_W)); GRID_H = int(data.get("grid_h", GRID_H))
                 inventory = data.get("inventory", [])
-                you = data.get("you"); 
+                you = data.get("you");
                 if you: players[str(your_id)] = you
                 sp = data.get("spells", {})
                 # normaliser les clés en str pour l'UI des sorts
@@ -164,11 +171,31 @@ def network_thread(sock):
             elif t == "inventory":
                 inventory = data.get("inventory", inventory)
             elif t == "chat":
-                chat_log.append((data.get("from","?"), data.get("msg",""))); 
+                chat_log.append((data.get("from","?"), data.get("msg","")));
                 if len(chat_log) > 60: del chat_log[0]
             elif t == "fx":
                 fx = copy.deepcopy(data); fx["until"] = time.time() + float(fx.get("duration",0.2))
                 FX.append(fx)
+            elif t == "merchant_open":
+                MERCHANT_UI.update({
+                    "open": True,
+                    "merchant_id": data.get("merchant_id"),
+                    "name": data.get("name","Marchand"),
+                    "stock": data.get("stock",[]),
+                    "sel": 0,
+                    "msg": ""
+                })
+            elif t == "merchant_result":
+                ok = data.get("ok", False)
+                MERCHANT_UI["msg"] = ("Achat/Vente OK" if ok else (data.get("msg","Erreur") or "Erreur"))
+            elif t == "quest_open":
+                QUEST_UI.update({"open": True, "list": data.get("list",[]), "sel": 0})
+            elif t == "quest_updated":
+                chat_log.append(("SYSTEM","Quête mise à jour."))
+                if len(chat_log) > 60: del chat_log[0]
+            elif t == "quest_result":
+                chat_log.append(("SYSTEM", data.get("msg","")))
+                if len(chat_log) > 60: del chat_log[0]
     except Exception as e:
         print("Réseau stoppé:", e)
 
@@ -296,6 +323,12 @@ def sprite_mob(name, x, y, moving, hp_ratio):
     elif "Loup" in name:
         col = (140,120,100); size=22
         pygame.draw.polygon(screen, col, [(int(x-12),int(y)),(int(x),int(y-8)),(int(x+12),int(y)),(int(x),int(y+8))])
+    elif "Orc" in name:
+        col = (110,90,70)
+        pygame.draw.rect(screen, col, (int(x-12), int(y-14), 24, 28), border_radius=3)
+    elif "Ours" in name:
+        col = (120,80,50)
+        pygame.draw.circle(screen, col, (int(x), int(y)), 12)
     else:
         col = (200,140,80); size=20
         pygame.draw.rect(screen, col, (int(x-10), int(y-10), 20, 20), border_radius=4)
@@ -336,6 +369,14 @@ def draw_npc(nid, info):
     if not info.get("hostile", True):
         # icône PNJ
         pygame.draw.circle(screen, (240,220,90), (int(sx), int(sy-16)), 3)
+        # nom PNJ
+        screen.blit(font.render(name, True, (230,230,180)), (int(sx-20), int(sy-30)))
+    else:
+        # nom + niveau pour mobs/boss
+        lvl = info.get("level")
+        label = name if lvl is None else f"{name} [Nv {lvl}]"
+        col = (255,190,190) if info.get("is_boss") else (240,230,230)
+        screen.blit(font.render(label, True, col), (int(sx-28), int(sy-30)))
 
 def draw_inventory():
     s = {"large":1.0, "medium":0.8, "hidden":0.0}.get(HUD_SCALE, 1.0)
@@ -583,7 +624,7 @@ while running:
             if UI_STATE == "select":
                 if event.key == pygame.K_r:
                     send_json(sock, {"type":"request_characters"})
-                elif event.key == pygame.K_n:
+                elif event.key == pygame.K_c:
                     create_name = ""; create_class_idx = 0; create_msg = ""
                     UI_STATE = "create"
                 elif event.key == pygame.K_UP:
@@ -704,20 +745,66 @@ while running:
             elif inv_open and event.key in (pygame.K_UP, pygame.K_DOWN):
                 if len(inventory) > 0:
                     inv_sel = (inv_sel - 1) % len(inventory) if event.key == pygame.K_UP else (inv_sel + 1) % len(inventory)
-            elif inv_open and key_is(event.key, "drop"):
+            elif inv_open and key_is(event.key, "drop") and not MERCHANT_UI.get("open"):
                 if 0 <= inv_sel < len(inventory):
                     obj = inventory[inv_sel]
                     send_json(sock, {"type":"drop", "id": obj.get("id"), "dx": 0, "dy": 24})
-            elif inv_open and key_is(event.key, "use"):
+            elif inv_open and key_is(event.key, "use") and not MERCHANT_UI.get("open"):
                 if 0 <= inv_sel < len(inventory):
                     obj = inventory[inv_sel]
                     send_json(sock, {"type":"use_item", "id": obj.get("id")})
-
+            elif (not inv_open) and key_is(event.key, "use"):
+                # interaction PNJ
+                send_json(sock, {"type":"interact"})
             # SORTS (viser à la souris)
             elif key_is(event.key, "spell_1"): try_cast(1, pygame.mouse.get_pos())
             elif key_is(event.key, "spell_2"): try_cast(2, pygame.mouse.get_pos())
             elif key_is(event.key, "spell_3"): try_cast(3, pygame.mouse.get_pos())
             elif key_is(event.key, "spell_4"): try_cast(4, pygame.mouse.get_pos())
+            # Map painter toggle
+            elif key_is(event.key, "paint_toggle"):
+                PAINTER_UI["open"] = not PAINTER_UI.get("open")
+                continue
+
+            # Marchand UI
+            if MERCHANT_UI.get("open"):
+                if event.key == pygame.K_ESCAPE:
+                    MERCHANT_UI["open"] = False
+                elif event.key == pygame.K_UP:
+                    st = MERCHANT_UI.get("stock", [])
+                    if st: MERCHANT_UI["sel"] = (MERCHANT_UI.get("sel",0) - 1) % len(st)
+                elif event.key == pygame.K_DOWN:
+                    st = MERCHANT_UI.get("stock", [])
+                    if st: MERCHANT_UI["sel"] = (MERCHANT_UI.get("sel",0) + 1) % len(st)
+                elif event.key == pygame.K_RETURN:
+                    idx = MERCHANT_UI.get("sel",0)
+                    mid = MERCHANT_UI.get("merchant_id")
+                    send_json(sock, {"type":"merchant_buy","merchant_id": mid, "index": idx})
+                elif key_is(event.key, "drop") and inv_open:
+                    # vendre l'objet sélectionné dans l'inventaire
+                    if 0 <= inv_sel < len(inventory):
+                        iid = inventory[inv_sel].get("id")
+                        send_json(sock, {"type":"merchant_sell","inventory_id": iid})
+
+            # Quêtes UI
+            if QUEST_UI.get("open"):
+                if event.key == pygame.K_ESCAPE:
+                    QUEST_UI["open"] = False
+                elif event.key == pygame.K_UP:
+                    lst = QUEST_UI.get("list", [])
+                    if lst: QUEST_UI["sel"] = (QUEST_UI.get("sel",0) - 1) % len(lst)
+                elif event.key == pygame.K_DOWN:
+                    lst = QUEST_UI.get("list", [])
+                    if lst: QUEST_UI["sel"] = (QUEST_UI.get("sel",0) + 1) % len(lst)
+                elif event.key == pygame.K_RETURN:
+                    lst = QUEST_UI.get("list", [])
+                    if 0 <= QUEST_UI.get("sel",0) < len(lst):
+                        q = lst[QUEST_UI.get("sel",0)]
+                        if q.get("status") in ("available","rejected"):
+                            send_json(sock, {"type":"quest_accept","quest_id": q.get("id")})
+                        elif q.get("status") in ("active",):
+                            send_json(sock, {"type":"quest_turnin","quest_id": q.get("id")})
+
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and inv_open and EQUIP_UI.get("open"):
             # drag depuis inventaire vers slot
             if 0 <= inv_sel < len(inventory):
@@ -742,13 +829,19 @@ while running:
                         tooltip["until"] = time.time() + 2.0
                         tooltip["pos"] = (mx, my)
                         break
-        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and EQUIP_UI.get("open"):
-            # drag inversé: slot -> inventaire (déséquiper)
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and PAINTER_UI.get("open"):
+            # peindre la tuile visée
             mx, my = event.pos
-            for sl, r in slot_rects.items():
-                if r.collidepoint(mx, my):
-                    send_json(sock, {"type":"unequip_slot", "slot": sl})
-                    break
+            tx = int((mx + cam_x)//TILE)
+            ty = int((my + cam_y)//TILE)
+            send_json(sock, {"type":"paint_tile","tx": tx, "ty": ty, "t": int(PAINTER_UI.get("tile",0))})
+        elif event.type == pygame.KEYDOWN and PAINTER_UI.get("open"):
+            # raccourcis de sélection tuile 0..4
+            if event.key in (pygame.K_0, pygame.K_KP0): PAINTER_UI["tile"] = 0
+            elif event.key in (pygame.K_1, pygame.K_KP1): PAINTER_UI["tile"] = 1
+            elif event.key in (pygame.K_2, pygame.K_KP2): PAINTER_UI["tile"] = 2
+            elif event.key in (pygame.K_3, pygame.K_KP3): PAINTER_UI["tile"] = 3
+            elif event.key in (pygame.K_4, pygame.K_KP4): PAINTER_UI["tile"] = 4
 
     # Déplacements (si en jeu et pas en menus / chat)
     if UI_STATE == "game" and (not chat_typing) and (not OPTIONS_OPEN):
@@ -834,64 +927,52 @@ while running:
         if STATS_OPEN: draw_stats()
         draw_equip_panel()
         if WORLDMAP_OPEN: draw_worldmap_overlay()
-    elif UI_STATE == "login":
-        # Panneau Login/Register
-        w, h = 480, 300
-        x, y = WIDTH//2 - w//2, HEIGHT//2 - h//2
-        pygame.draw.rect(screen, (16,16,20), (x,y,w,h))
-        pygame.draw.rect(screen, (120,120,140), (x,y,w,h), 2)
-        title = f"Connexion" if login_mode=="login" else "Inscription"
-        screen.blit(bigfont.render(title, True, (255,255,255)), (x+16,y+12))
-        screen.blit(font.render("F2: basculer Connexion/Inscription", True, (200,200,200)), (x+16,y+42))
-        # Username
-        pygame.draw.rect(screen, (28,28,34), (x+16, y+76, w-32, 32))
-        pygame.draw.rect(screen, (160,160,180), (x+16, y+76, w-32, 32), 2 if login_focus=="user" else 1)
-        screen.blit(font.render("Utilisateur:", True, (220,220,220)), (x+20, y+56))
-        screen.blit(bigfont.render(login_username or "", True, (255,255,255)), (x+24, y+82))
-        # Password
-        pygame.draw.rect(screen, (28,28,34), (x+16, y+144, w-32, 32))
-        pygame.draw.rect(screen, (160,160,180), (x+16, y+144, w-32, 32), 2 if login_focus=="pass" else 1)
-        screen.blit(font.render("Mot de passe:", True, (220,220,220)), (x+20, y+124))
-        dots = "*" * len(login_password)
-        screen.blit(bigfont.render(dots, True, (255,255,255)), (x+24, y+150))
-        # Hint & Msg
-        screen.blit(font.render("Entrée: valider • Tab: changer champ • F2: basculer", True, (200,200,200)), (x+16, y+h-48))
-        if login_msg:
-            screen.blit(font.render(login_msg, True, (240,200,120)), (x+16, y+h-28))
-    elif UI_STATE == "select":
-        w, h = 560, 380
-        x, y = WIDTH//2 - w//2, HEIGHT//2 - h//2
-        pygame.draw.rect(screen, (16,16,20), (x,y,w,h))
-        pygame.draw.rect(screen, (120,120,140), (x,y,w,h), 2)
-        screen.blit(bigfont.render("Sélection du personnage", True, (255,255,255)), (x+16,y+12))
-        screen.blit(font.render("↑/↓ sélectionner • Entrée: jouer • C: créer • R: rafraîchir", True, (200,200,200)), (x+16,y+40))
-        list_y = y+76
-        for i, ch in enumerate(char_list):
-            sel = (i == char_sel)
-            name = ch.get("name","?"); cls = ch.get("class","?"); lvl = ch.get("level",1)
-            label = f"> {name}  [{cls}]  niv {lvl}" if sel else f"  {name}  [{cls}]  niv {lvl}"
-            col = (255,255,255) if sel else (210,210,210)
-            screen.blit(font.render(label, True, col), (x+24, list_y + i*26))
-        if not char_list:
-            screen.blit(font.render("Aucun personnage. Appuyez sur C pour créer.", True, (220,180,120)), (x+24, list_y))
-        if char_msg:
-            screen.blit(font.render(char_msg, True, (240,200,120)), (x+16, y+h-28))
-    elif UI_STATE == "create":
-        w, h = 560, 320
-        x, y = WIDTH//2 - w//2, HEIGHT//2 - h//2
-        pygame.draw.rect(screen, (16,16,20), (x,y,w,h))
-        pygame.draw.rect(screen, (120,120,140), (x,y,w,h), 2)
-        screen.blit(bigfont.render("Création de personnage", True, (255,255,255)), (x+16,y+12))
-        screen.blit(font.render("Nom (écrire) • Classe (←/→) • Entrée: créer • Échap: retour", True, (200,200,200)), (x+16,y+40))
-        screen.blit(font.render("Nom:", True, (220,220,220)), (x+20, y+84))
-        pygame.draw.rect(screen, (28,28,34), (x+90, y+80, w-110, 32))
-        pygame.draw.rect(screen, (160,160,180), (x+90, y+80, w-110, 32), 1)
-        screen.blit(bigfont.render(create_name or "", True, (255,255,255)), (x+96, y+86))
-        screen.blit(font.render("Classe:", True, (220,220,220)), (x+20, y+140))
-        cls = CLASSES[create_class_idx]
-        screen.blit(bigfont.render(f"← {cls} →", True, (230,230,230)), (x+100, y+140))
-        if create_msg:
-            screen.blit(font.render(create_msg, True, (240,200,120)), (x+16, y+h-28))
+        # Panneaux additionnels
+        if MERCHANT_UI.get("open"):
+            # panneau marchand
+            mw, mh = 380, 300
+            mx, my = 32, 32
+            pygame.draw.rect(screen, (20,20,24), (mx, my, mw, mh))
+            pygame.draw.rect(screen, (110,110,130), (mx, my, mw, mh), 2)
+            screen.blit(bigfont.render(MERCHANT_UI.get("name","Marchand"), True, (255,255,255)), (mx+12, my+10))
+            screen.blit(font.render("↑/↓ sélectionner • Entrée acheter • G (inv ouvert): vendre • Échap fermer", True, (220,220,220)), (mx+12, my+34))
+            st = MERCHANT_UI.get("stock", [])
+            yy = my + 60
+            for i, it in enumerate(st):
+                sel = (i == MERCHANT_UI.get("sel",0))
+                nm = it.get("name","?"); tp = it.get("type","?"); pw = int(it.get("power",0)); pr = int(it.get("price",0))
+                label = f"> {nm} [{tp}] +{pw}  {pr} or" if sel else f"  {nm} [{tp}] +{pw}  {pr} or"
+                col = (255,255,255) if sel else (210,210,210)
+                screen.blit(font.render(label, True, col), (mx+14, yy)); yy += 22
+            if MERCHANT_UI.get("msg"):
+                screen.blit(font.render(MERCHANT_UI.get("msg"), True, (240,200,120)), (mx+12, my+mh-26))
+        if QUEST_UI.get("open"):
+            qw, qh = 440, 300
+            qx, qy = WIDTH//2 - qw//2, 40
+            pygame.draw.rect(screen, (20,20,24), (qx, qy, qw, qh))
+            pygame.draw.rect(screen, (110,110,130), (qx, qy, qw, qh), 2)
+            screen.blit(bigfont.render("Quêtes", True, (255,255,255)), (qx+12, qy+10))
+            lst = QUEST_UI.get("list", [])
+            yy = qy + 40
+            for i, q in enumerate(lst):
+                sel = (i == QUEST_UI.get("sel",0))
+                status = q.get("status","?")
+                title = q.get("title","?")
+                label = f"> {title} - {status}" if sel else f"  {title} - {status}"
+                col = (255,255,255) if sel else (210,210,210)
+                screen.blit(font.render(label, True, col), (qx+14, yy)); yy += 22
+            # détails
+            if 0 <= QUEST_UI.get("sel",0) < len(lst):
+                q = lst[QUEST_UI.get("sel",0)]
+                desc = q.get("desc","")
+                screen.blit(font.render(desc, True, (230,230,230)), (qx+14, qy+qh-40))
+        if PAINTER_UI.get("open"):
+            pw, ph = 260, 76
+            px0, py0 = WIDTH- pw - 14, HEIGHT - ph - 14
+            pygame.draw.rect(screen, (18,18,22), (px0, py0, pw, ph))
+            pygame.draw.rect(screen, (120,120,140), (px0, py0, pw, ph), 2)
+            screen.blit(font.render("Mode éditeur de carte (F9)", True, (240,240,240)), (px0+8, py0+6))
+            screen.blit(font.render(f"Tuile: {PAINTER_UI.get('tile',0)}  (0..4)  Clic gauche pour peindre", True, (220,220,220)), (px0+8, py0+30))
 
     pygame.display.flip()
     # tooltip render
