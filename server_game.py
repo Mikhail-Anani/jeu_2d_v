@@ -4,6 +4,24 @@ import socket, threading, json, random, time, math, os, hashlib
 HOST = "127.0.0.1"
 PORT = 5555
 
+# Charger les données JSON
+def load_merchants():
+    try:
+        with open("merchants.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def load_quests():
+    try:
+        with open("quests.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {"starter_quests": [], "tower_quests": []}
+
+MERCHANTS_DATA = load_merchants()
+QUESTS_DATA = load_quests()
+
 # ---------- Monde ----------
 TILE = 40
 # Monde infini chunké 64x64
@@ -48,6 +66,11 @@ players = {}         # pid -> {...}
 inventories = {}     # pid -> [items]
 cooldowns = {}       # pid -> {"spells": {slot: ready_ts}}
 next_id = 1
+
+# Variables pour le village et la tour
+village_initialized = False
+current_floor_maps = {}  # pid -> floor_number pour joueurs dans la tour
+player_quests = {}       # pid -> quest_progress
 
 # Comptes / persistance
 ACCOUNTS_PATH = "accounts.json"
@@ -112,6 +135,42 @@ def generate_chunk(cx: int, cy: int):
     base_y = cy * CHUNK_TILES
     river_x = int(20 * math.sin((base_y) * 0.01))
     river_y = int(20 * math.cos((base_x) * 0.01))
+    
+    # Village de départ au centre (chunk 0,0)
+    if cx == 0 and cy == 0:
+        # Créer une grande place pour le village
+        for ty in range(16, 48):
+            for tx in range(16, 48):
+                tiles[ty][tx] = 3  # sable pour la place du village
+        
+        # Maisons et bâtiments du village
+        # Forge (coin haut-gauche)
+        for y in range(20, 26):
+            for x in range(20, 28):
+                tiles[y][x] = 1 if y in [20, 25] or x in [20, 27] else 3
+        
+        # Maison de l'alchimiste (coin haut-droit)
+        for y in range(20, 26):
+            for x in range(36, 44):
+                tiles[y][x] = 1 if y in [20, 25] or x in [36, 43] else 3
+        
+        # Maison du maître des quêtes (bas)
+        for y in range(38, 44):
+            for x in range(28, 36):
+                tiles[y][x] = 1 if y in [38, 43] or x in [28, 35] else 3
+        
+        # Tour centrale (centre exact)
+        tower_center_x, tower_center_y = 32, 32
+        for y in range(tower_center_y-3, tower_center_y+4):
+            for x in range(tower_center_x-3, tower_center_x+4):
+                if 0 <= y < CHUNK_TILES and 0 <= x < CHUNK_TILES:
+                    tiles[y][x] = 1  # Murs de la tour
+        # Entrée de la tour
+        tiles[tower_center_y+3][tower_center_x] = 3  # Porte d'entrée
+        
+        return tiles
+    
+    # Génération normale pour les autres chunks
     for ty in range(CHUNK_TILES):
         for tx in range(CHUNK_TILES):
             gx = base_x + tx
@@ -126,7 +185,8 @@ def generate_chunk(cx: int, cy: int):
             elif n > 1.25:
                 t = 1  # montagne/mur
             tiles[ty][tx] = t
-    # routes/bridges proche du centre monde (look pont + route comme sur l'image)
+    
+    # routes/bridges proche du centre monde
     if abs(cx) <= 1:
         mid = CHUNK_TILES//2
         for x in range(6, CHUNK_TILES-6):
@@ -137,7 +197,8 @@ def generate_chunk(cx: int, cy: int):
         for y in range(6, CHUNK_TILES-6):
             tiles[y][mid] = 4
             tiles[y][mid-1] = 4
-    # Ajouter parfois un village: place en sable + quelques maisons (murs)
+    
+    # Villages aléatoires dans les autres chunks
     if r.random() < 0.07:
         vx = r.randint(8, CHUNK_TILES-16)
         vy = r.randint(8, CHUNK_TILES-16)
@@ -163,8 +224,7 @@ def generate_chunk(cx: int, cy: int):
                     tiles[y][hx] = 1
                 if 0 <= y < CHUNK_TILES and 0 <= hx+hw-1 < CHUNK_TILES:
                     tiles[y][hx+hw-1] = 1
-        # marquer la présence d'un PNJ au centre de la place (utilisé plus tard lors du chargement proximité)
-        tiles[vy+vh//2][vx+vw//2] = tiles[vy+vh//2][vx+vw//2]  # no-op: juste pour garder une trace de village
+    
     return tiles
 
 def get_chunk(cx: int, cy: int):
@@ -201,6 +261,128 @@ def spawn_villager_npc(x: int, y: int, name: str = None):
     nid = next_npc_id; next_npc_id += 1
     npcs[nid] = {"x": x, "y": y, "dx": 0, "dy": 0, "name": name or "Villageois", "hp": 1000000, "max_hp": 1000000, "hostile": False, "speed": 0.0, "dmg": 0}
     return nid
+
+def spawn_merchant_npc(x: int, y: int, merchant_type: str):
+    """Crée un PNJ marchand avec son inventaire"""
+    global next_npc_id
+    nid = next_npc_id; next_npc_id += 1
+    merchant_data = MERCHANTS_DATA.get(merchant_type, {})
+    name = merchant_data.get("name", "Marchand")
+    npcs[nid] = {
+        "x": x, "y": y, "dx": 0, "dy": 0,
+        "name": name, "hp": 1000000, "max_hp": 1000000, 
+        "hostile": False, "speed": 0.0, "dmg": 0,
+        "type": "merchant", "merchant_type": merchant_type,
+        "inventory": merchant_data.get("inventory", [])
+    }
+    return nid
+
+def spawn_quest_npc(x: int, y: int, name: str = "Maître des Quêtes"):
+    """Crée un PNJ donneur de quêtes"""
+    global next_npc_id
+    nid = next_npc_id; next_npc_id += 1
+    npcs[nid] = {
+        "x": x, "y": y, "dx": 0, "dy": 0,
+        "name": name, "hp": 1000000, "max_hp": 1000000,
+        "hostile": False, "speed": 0.0, "dmg": 0,
+        "type": "quest_giver"
+    }
+    return nid
+
+def spawn_tower_entrance(x: int, y: int):
+    """Crée l'entrée de la tour centrale"""
+    global next_item_id
+    iid = next_item_id; next_item_id += 1
+    items[iid] = {
+        "x": x, "y": y, "name": "Tour Mystérieuse", 
+        "type": "tower_entrance", "power": 0,
+        "floor": 1, "total_floors": 100
+    }
+    return iid
+
+def initialize_starter_village():
+    """Initialise le village de départ avec tous les NPCs"""
+    global village_initialized
+    if village_initialized:
+        return
+    
+    # Coordonnées dans le chunk central (0,0)
+    chunk_offset_x = 0 * CHUNK_TILES * TILE
+    chunk_offset_y = 0 * CHUNK_TILES * TILE
+    
+    # Forgeron (dans la forge)
+    forge_x = chunk_offset_x + (24 * TILE)
+    forge_y = chunk_offset_y + (23 * TILE)
+    spawn_merchant_npc(forge_x, forge_y, "weapon_merchant")
+    
+    # Alchimiste (dans sa maison)
+    alchemist_x = chunk_offset_x + (40 * TILE)
+    alchemist_y = chunk_offset_y + (23 * TILE)
+    spawn_merchant_npc(alchemist_x, alchemist_y, "alchemist")
+    
+    # Maître des quêtes
+    quest_x = chunk_offset_x + (32 * TILE)
+    quest_y = chunk_offset_y + (41 * TILE)
+    spawn_quest_npc(quest_x, quest_y)
+    
+    # Entrée de la tour
+    tower_x = chunk_offset_x + (32 * TILE)
+    tower_y = chunk_offset_y + (35 * TILE)  # Devant la tour
+    spawn_tower_entrance(tower_x, tower_y)
+    
+    village_initialized = True
+    print("Village de départ initialisé avec succès!")
+
+def generate_tower_floor(floor_number):
+    """Génère une carte d'étage de tour"""
+    # Carte simple 20x20 pour chaque étage
+    floor_size = 20
+    floor_tiles = [[0 for _ in range(floor_size)] for _ in range(floor_size)]
+    
+    # Murs extérieurs
+    for x in range(floor_size):
+        floor_tiles[0][x] = 1
+        floor_tiles[floor_size-1][x] = 1
+    for y in range(floor_size):
+        floor_tiles[y][0] = 1
+        floor_tiles[y][floor_size-1] = 1
+    
+    # Obstacles intérieurs aléatoirement
+    r = random.Random(floor_number)  # Seed déterministe
+    for _ in range(floor_number // 5 + 2):  # Plus d'obstacles aux étages élevés
+        ox = r.randint(2, floor_size-3)
+        oy = r.randint(2, floor_size-3)
+        floor_tiles[oy][ox] = 1
+    
+    # Escalier vers étage suivant (sauf étage 100)
+    if floor_number < 100:
+        stair_x = floor_size - 2
+        stair_y = floor_size - 2
+        floor_tiles[stair_y][stair_x] = 4  # Type spécial escalier
+    
+    return floor_tiles
+
+def spawn_tower_monsters(floor_number, center_x, center_y):
+    """Génère les monstres pour un étage de tour"""
+    monster_count = min(8, 2 + floor_number // 10)  # Plus de monstres aux étages élevés
+    
+    for _ in range(monster_count):
+        # Position aléatoire dans la zone de l'étage
+        mx = center_x + random.randint(-300, 300)
+        my = center_y + random.randint(-300, 300)
+        
+        # Créer monstre avec niveau approprié
+        t = make_mob_template(floor_number)
+        nid = spawn_mob_at(mx, my)
+        npcs[nid].update(t)
+    
+    # Boss aux étages 5, 10, 15, etc.
+    if floor_number % 5 == 0:
+        boss_x = center_x + random.randint(-100, 100)
+        boss_y = center_y + random.randint(-100, 100)
+        boss_t = make_boss_template(floor_number)
+        boss_nid = spawn_mob_at(boss_x, boss_y)
+        npcs[boss_nid].update(boss_t)
 
 # Items au sol
 items = {}          # iid -> {"x","y","name","type","power":int, ...}
@@ -322,15 +504,91 @@ def send_to(pid, obj):
     if conn: _safe_send(conn, obj)
 
 # ---------- Mobs / Loot ----------
-def make_mob_template():
-    templates = [
-        {"name": "Rat géant", "hp": 28, "speed": 1.6, "dmg": 6},
-        {"name": "Gobelin",   "hp": 42, "speed": 1.9, "dmg": 7},
-        {"name": "Slime",     "hp": 36, "speed": 1.3, "dmg": 5},
-        {"name": "Loup",      "hp": 50, "speed": 2.3, "dmg": 8},
+def make_mob_template(floor=1):
+    """Crée un template de monstre basé sur l'étage"""
+    base_monsters = [
+        {"name": "Slime", "hp": 15, "speed": 0.6, "dmg": 6, "level": 1, "sprite": "slime"},
+        {"name": "Gobelin", "hp": 25, "speed": 1.0, "dmg": 10, "level": 2, "sprite": "goblin"},
+        {"name": "Loup", "hp": 35, "speed": 1.4, "dmg": 14, "level": 3, "sprite": "wolf"},
+        {"name": "Orc", "hp": 50, "speed": 0.8, "dmg": 18, "level": 4, "sprite": "orc"},
+        {"name": "Ours", "hp": 70, "speed": 0.7, "dmg": 22, "level": 5, "sprite": "bear"},
     ]
-    t = random.choice(templates)
-    return {"name": t["name"], "hp": t["hp"], "max_hp": t["hp"], "hostile": True, "speed": t["speed"], "dmg": t["dmg"], "atk_until": 0}
+    
+    # Sélection du monstre basé sur l'étage
+    if floor <= 20:
+        monster_pool = base_monsters[:2]  # Slimes et Gobelins
+    elif floor <= 40:
+        monster_pool = base_monsters[:3]  # + Loups
+    elif floor <= 60:
+        monster_pool = base_monsters[:4]  # + Orcs
+    elif floor <= 80:
+        monster_pool = base_monsters  # Tous les monstres de base
+    else:
+        # Étages élevés: dragons et monstres puissants
+        monster_pool = [
+            {"name": "Dragon rouge", "hp": 200, "speed": 1.2, "dmg": 45, "level": 20, "sprite": "dragon"},
+            {"name": "Golem de glace", "hp": 180, "speed": 0.6, "dmg": 40, "level": 18, "sprite": "ice_golem"},
+            {"name": "Démon de feu", "hp": 160, "speed": 1.5, "dmg": 35, "level": 16, "sprite": "fire_demon"},
+        ]
+    
+    t = random.choice(monster_pool)
+    
+    # Scaling basé sur l'étage
+    scaling_factor = 1 + (floor - 1) * 0.15
+    scaled_hp = int(t["hp"] * scaling_factor)
+    scaled_dmg = int(t["dmg"] * scaling_factor)
+    scaled_level = t["level"] + (floor - 1) // 5
+    
+    return {
+        "name": t["name"], 
+        "hp": scaled_hp, 
+        "max_hp": scaled_hp, 
+        "hostile": True, 
+        "speed": t["speed"], 
+        "dmg": scaled_dmg, 
+        "atk_until": 0,
+        "level": scaled_level,
+        "sprite": t["sprite"],
+        "floor": floor
+    }
+
+def make_boss_template(floor):
+    """Crée un template de boss pour l'étage donné"""
+    if floor % 10 == 0:  # Gros boss tous les 10 étages
+        bosses = [
+            {"name": "Roi Gobelin", "hp": 500, "speed": 1.0, "dmg": 50, "sprite": "goblin_chief"},
+            {"name": "Seigneur Dragon", "hp": 800, "speed": 0.8, "dmg": 70, "sprite": "dragon"},
+            {"name": "Archidémon", "hp": 1200, "speed": 1.2, "dmg": 90, "sprite": "fire_demon"},
+        ]
+    else:  # Boss intermédiaires tous les 5 étages
+        bosses = [
+            {"name": "Chef Gobelin", "hp": 200, "speed": 1.2, "dmg": 30, "sprite": "goblin_chief"},
+            {"name": "Ours Alpha", "hp": 250, "speed": 0.9, "dmg": 35, "sprite": "bear"},
+            {"name": "Golem de Pierre", "hp": 300, "speed": 0.6, "dmg": 40, "sprite": "ice_golem"},
+        ]
+    
+    boss_type = floor // 20  # Change les types de boss par tranches
+    t = bosses[boss_type % len(bosses)]
+    
+    # Scaling plus important pour les boss
+    scaling_factor = 1 + (floor - 1) * 0.25
+    scaled_hp = int(t["hp"] * scaling_factor)
+    scaled_dmg = int(t["dmg"] * scaling_factor)
+    
+    return {
+        "name": t["name"],
+        "hp": scaled_hp,
+        "max_hp": scaled_hp,
+        "hostile": True,
+        "speed": t["speed"],
+        "dmg": scaled_dmg,
+        "atk_until": 0,
+        "level": floor + 5,
+        "sprite": t["sprite"],
+        "is_boss": True,
+        "floor": floor,
+        "special_attacks": True
+    }
 
 def spawn_mob():
     global next_npc_id
@@ -712,20 +970,88 @@ def handle_client(conn, addr):
                         p = players.get(pid)
                         if p and not p["dead"]:
                             px, py = p["x"], p["y"]
+                            
+                            # Vérifier interaction avec NPCs
+                            target_npc = None; best_npc_d2 = 999999
+                            for nid, n in npcs.items():
+                                if not n.get("hostile", True):  # NPCs non hostiles seulement
+                                    d2 = (n["x"]-px)**2 + (n["y"]-py)**2
+                                    if d2 < best_npc_d2 and d2 <= (50**2):
+                                        best_npc_d2 = d2; target_npc = nid
+                            
+                            if target_npc is not None:
+                                npc = npcs[target_npc]
+                                if npc.get("type") == "merchant":
+                                    # Ouvrir l'interface de marchand
+                                    send_to(pid, {
+                                        "type": "merchant_dialogue",
+                                        "npc_name": npc["name"],
+                                        "merchant_type": npc["merchant_type"],
+                                        "inventory": npc["inventory"]
+                                    })
+                                elif npc.get("type") == "quest_giver":
+                                    # Ouvrir l'interface de quêtes
+                                    available_quests = [q for q in QUESTS_DATA.get("starter_quests", []) 
+                                                      if q["status"] == "available"]
+                                    send_to(pid, {
+                                        "type": "quest_dialogue",
+                                        "npc_name": npc["name"],
+                                        "available_quests": available_quests
+                                    })
+                                else:
+                                    # NPC de village générique
+                                    greetings = [
+                                        "Bienvenue dans notre village !",
+                                        "Que la fortune vous sourie !",
+                                        "Attention aux dangers de la tour...",
+                                        "Les marchands ont de bonnes affaires aujourd'hui."
+                                    ]
+                                    import random
+                                    greeting = random.choice(greetings)
+                                    send_to(pid, {
+                                        "type": "npc_dialogue",
+                                        "npc_name": npc["name"],
+                                        "message": greeting
+                                    })
+                                return  # Pas besoin de vérifier les items si on interagit avec un NPC
+                            
+                            # Vérifier interaction avec entrée de tour
                             target_iid = None; best_d2 = 999999
                             for iid, it in items.items():
                                 d2 = (it["x"]-px)**2 + (it["y"]-py)**2
                                 if d2 < best_d2 and d2 <= (40**2):
                                     best_d2 = d2; target_iid = iid
+                            
                             if target_iid is not None:
-                                it = items.pop(target_iid)
-                                if it["type"] == "gold":
+                                it = items[target_iid]
+                                if it["type"] == "tower_entrance":
+                                    # Entrer dans la tour
+                                    floor_to_enter = it.get("floor", 1)
+                                    current_floor_maps[pid] = floor_to_enter
+                                    
+                                    # Téléporter le joueur dans l'étage de la tour
+                                    tower_center_x = 10000  # Zone dédiée pour la tour
+                                    tower_center_y = 10000 + (floor_to_enter * 1000)
+                                    p["x"] = tower_center_x
+                                    p["y"] = tower_center_y
+                                    
+                                    # Générer les monstres de l'étage
+                                    spawn_tower_monsters(floor_to_enter, tower_center_x, tower_center_y)
+                                    
+                                    send_to(pid, {
+                                        "type": "tower_entered",
+                                        "floor": floor_to_enter,
+                                        "message": f"Vous entrez dans l'étage {floor_to_enter} de la tour..."
+                                    })
+                                    return
+                                elif it["type"] == "gold":
+                                    items.pop(target_iid)
                                     p["gold"] += int(it.get("power",1))
                                     sys_msg = {"type":"chat","from":"SYSTEM","msg":f"{p['name']} +{it.get('power',1)} or"}
-                                    # persistance
                                     ident = pid_identity.get(pid)
                                     if ident: mark_dirty(ident["username"])
                                 else:
+                                    items.pop(target_iid)
                                     # Utiliser un ID d'inventaire indépendant
                                     inv_id = 1000000 + target_iid
                                     inventories[pid].append({"id": inv_id, "name": it["name"], "type": it["type"], "power": it.get("power",0)})
@@ -900,6 +1226,7 @@ def handle_client(conn, addr):
 def logic_loop():
     with lock:
         for _ in range(6): spawn_mob()
+        initialize_starter_village()  # Initialiser le village au démarrage
     broadcast_state()
     tick = 1.0 / TICK_HZ
     while True:

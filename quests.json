@@ -1,0 +1,60 @@
+{
+  "starter_quests": [
+    {
+      "id": "welcome_quest",
+      "name": "Bienvenue dans le village",
+      "description": "Parlez au forgeron et à l'alchimiste pour vous familiariser avec le commerce.",
+      "objectives": [
+        {"type": "talk_to_npc", "target": "weapon_merchant", "completed": false},
+        {"type": "talk_to_npc", "target": "alchemist", "completed": false}
+      ],
+      "rewards": {"gold": 25, "xp": 50},
+      "status": "available"
+    },
+    {
+      "id": "first_hunt",
+      "name": "Premier combat",
+      "description": "Éliminez 3 slimes pour prouver votre valeur.",
+      "objectives": [
+        {"type": "kill", "target": "slime", "count": 3, "current": 0, "completed": false}
+      ],
+      "rewards": {"gold": 50, "xp": 100, "item": "Potion de soin"},
+      "status": "locked",
+      "requires": ["welcome_quest"]
+    },
+    {
+      "id": "tower_introduction",
+      "name": "La Tour Mystérieuse",
+      "description": "Explorez le premier étage de la tour centrale.",
+      "objectives": [
+        {"type": "enter_area", "target": "tower_floor_1", "completed": false}
+      ],
+      "rewards": {"gold": 100, "xp": 200},
+      "status": "locked",
+      "requires": ["first_hunt"]
+    },
+    {
+      "id": "merchant_delivery",
+      "name": "Livraison importante",
+      "description": "Livrez un paquet spécial de l'alchimiste au forgeron.",
+      "objectives": [
+        {"type": "deliver_item", "item": "Paquet alchimique", "from": "alchemist", "to": "weapon_merchant", "completed": false}
+      ],
+      "rewards": {"gold": 75, "xp": 150},
+      "status": "available"
+    }
+  ],
+  "tower_quests": [
+    {
+      "id": "floor_5_boss",
+      "name": "Le Gardien du 5ème étage",
+      "description": "Vainquez le boss du 5ème étage de la tour.",
+      "objectives": [
+        {"type": "kill_boss", "target": "goblin_chief", "floor": 5, "completed": false}
+      ],
+      "rewards": {"gold": 200, "xp": 500, "item": "Clé étage supérieur"},
+      "status": "locked",
+      "requires": ["tower_introduction"]
+    }
+  ]
+}
