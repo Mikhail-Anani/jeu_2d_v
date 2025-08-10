@@ -18,6 +18,12 @@ NPC_SIZE = 22
 ITEM_SIZE = 16
 TICK_HZ = 20  # cadence logique et émission d'état
 
+# Fichiers de données
+DATA_DIR = "."
+MERCHANTS_PATH = os.path.join(DATA_DIR, "merchants.json")
+QUESTS_PATH = os.path.join(DATA_DIR, "quests.json")
+MAP_OVERRIDES_PATH = os.path.join(DATA_DIR, "map_overrides.json")
+
 # Sorts (slots 1..4) par classe
 SPELLS_BY_CLASS = {
     "Guerrier": {
@@ -48,6 +54,12 @@ players = {}         # pid -> {...}
 inventories = {}     # pid -> [items]
 cooldowns = {}       # pid -> {"spells": {slot: ready_ts}}
 next_id = 1
+
+# données externes
+merchants_data = {}
+quests_data = {}
+map_overrides = {}           # (tx,ty) -> tile
+_overrides_by_chunk = {}     # (cx,cy) -> set((tx,ty)) pour accélérer l'application
 
 # Comptes / persistance
 ACCOUNTS_PATH = "accounts.json"
@@ -93,6 +105,102 @@ def saver_loop():
         if to_save is not None:
             with lock:
                 save_accounts()
+
+# Chargement/Enregistrement de données JSON
+
+def _ensure_default_files():
+    # marchands par défaut
+    if not os.path.exists(MERCHANTS_PATH):
+        default_merchants = {
+            "weaponsmith": {
+                "name": "Marchand d'armes",
+                "stock": [
+                    {"name":"Épée rouillée","type":"weapon","power":5, "price": 20},
+                    {"name":"Hache légère","type":"weapon","power":8, "price": 45},
+                    {"name":"Arc court","type":"weapon","power":7, "price": 38}
+                ]
+            },
+            "alchemist": {
+                "name": "Alchimiste",
+                "stock": [
+                    {"name":"Petite potion","type":"potion","power":30, "price": 10},
+                    {"name":"Potion de mana","type":"scroll","power":25, "price": 14},
+                    {"name":"Tonique fortifiant","type":"potion","power":50, "price": 25}
+                ]
+            }
+        }
+        try:
+            with open(MERCHANTS_PATH, "w", encoding="utf-8") as f:
+                json.dump(default_merchants, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+    # quêtes par défaut
+    if not os.path.exists(QUESTS_PATH):
+        default_quests = {
+            "q_slimes_5": {"title": "Nettoyage gluant", "desc": "Éliminer 5 Slimes près du village.", "requirements": {"kill": {"Slime": 5}}, "rewards": {"xp": 60, "gold": 20}},
+            "q_gobs_3": {"title": "Tapage gobelin", "desc": "Tuer 3 Gobelins.", "requirements": {"kill": {"Gobelin": 3}}, "rewards": {"xp": 80, "gold": 25}}
+        }
+        try:
+            with open(QUESTS_PATH, "w", encoding="utf-8") as f:
+                json.dump(default_quests, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+    # overrides par défaut
+    if not os.path.exists(MAP_OVERRIDES_PATH):
+        try:
+            with open(MAP_OVERRIDES_PATH, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+        except Exception:
+            pass
+
+def load_merchants():
+    global merchants_data
+    try:
+        with open(MERCHANTS_PATH, "r", encoding="utf-8") as f:
+            merchants_data = json.load(f)
+    except Exception:
+        merchants_data = {}
+
+
+def load_quests():
+    global quests_data
+    try:
+        with open(QUESTS_PATH, "r", encoding="utf-8") as f:
+            quests_data = json.load(f)
+    except Exception:
+        quests_data = {}
+
+
+def load_map_overrides():
+    global map_overrides, _overrides_by_chunk
+    try:
+        with open(MAP_OVERRIDES_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+            # stocker clés en tuples d'int
+            map_overrides = { (int(k.split(",")[0]), int(k.split(",")[1])): int(v) for k,v in raw.items() }
+    except Exception:
+        map_overrides = {}
+    _rebuild_overrides_index()
+
+
+def save_map_overrides():
+    try:
+        raw = { f"{tx},{ty}": int(t) for (tx,ty), t in map_overrides.items() }
+        tmp = MAP_OVERRIDES_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(raw, f, indent=0)
+        os.replace(tmp, MAP_OVERRIDES_PATH)
+    except Exception:
+        pass
+
+
+def _rebuild_overrides_index():
+    global _overrides_by_chunk
+    _overrides_by_chunk = {}
+    for (tx,ty), t in map_overrides.items():
+        cx = math.floor(tx / CHUNK_TILES)
+        cy = math.floor(ty / CHUNK_TILES)
+        _overrides_by_chunk.setdefault((cx,cy), set()).add((tx,ty))
 
 # ---------- Monde procédural chunké & collisions ----------
 # types: 0 herbe, 1 montagne/mur (bloquant), 2 eau (bloquant), 3 sable, 4 route/pont
@@ -182,52 +290,103 @@ def get_tile_at(tx: int, ty: int) -> int:
     ly = int(ty - cy * CHUNK_TILES)
     tiles = get_chunk(cx, cy)
     if 0 <= ly < CHUNK_TILES and 0 <= lx < CHUNK_TILES:
+        # override ponctuel
+        ov = map_overrides.get((tx,ty))
+        if ov is not None:
+            return ov
         return tiles[ly][lx]
     return 0
+
+
+def get_chunk_with_overrides(cx: int, cy: int):
+    tiles = [row[:] for row in get_chunk(cx, cy)]
+    for (tx,ty) in _overrides_by_chunk.get((cx,cy), set()):
+        lx = int(tx - cx*CHUNK_TILES)
+        ly = int(ty - cy*CHUNK_TILES)
+        if 0 <= ly < CHUNK_TILES and 0 <= lx < CHUNK_TILES:
+            tiles[ly][lx] = map_overrides.get((tx,ty), tiles[ly][lx])
+    return tiles
 
 # PNJ (mobs)
 npcs = {}           # nid -> {...}
 next_npc_id = 1
 
-def spawn_mob_at(x: int, y: int):
+# thématisation & niveaux
+
+def compute_world_level_for_pos(x: int, y: int) -> int:
+    d = math.hypot(x, y)
+    return max(1, int(d // (TILE*30)) + 1)  # +1 niveau tous les ~1200 px
+
+
+def make_mob_template_for_level(level: int, theme: str = None):
+    base_templates = [
+        {"name": "Rat géant", "hp": 28, "speed": 1.6, "dmg": 6},
+        {"name": "Gobelin",   "hp": 42, "speed": 1.9, "dmg": 7},
+        {"name": "Slime",     "hp": 36, "speed": 1.3, "dmg": 5},
+        {"name": "Loup",      "hp": 50, "speed": 2.3, "dmg": 8},
+        {"name": "Orc",       "hp": 70, "speed": 1.8, "dmg": 10},
+        {"name": "Ours",      "hp": 90, "speed": 1.4, "dmg": 12},
+    ]
+    if theme == "slime": base_templates = [{"name":"Slime", "hp":36, "speed":1.3, "dmg":5}]
+    if theme == "gob": base_templates = [{"name":"Gobelin", "hp":42, "speed":1.9, "dmg":7}]
+    if theme == "wolf": base_templates = [{"name":"Loup", "hp":50, "speed":2.3, "dmg":8}]
+    if theme == "orc": base_templates = [{"name":"Orc", "hp":70, "speed":1.8, "dmg":10}]
+    if theme == "bear": base_templates = [{"name":"Ours", "hp":90, "speed":1.4, "dmg":12}]
+    t = random.choice(base_templates)
+    scale = 1.0 + max(0, level-1) * 0.18
+    hp = int(t["hp"] * scale)
+    dmg = int(t["dmg"] * (0.7 + max(0, level-1)*0.12))
+    return {"name": t["name"], "hp": hp, "max_hp": hp, "hostile": True, "speed": t["speed"], "dmg": dmg, "atk_until": 0, "level": int(level)}
+
+
+def spawn_mob_at(x: int, y: int, level: int = None, theme: str = None):
     global next_npc_id
-    t = make_mob_template()
+    if level is None:
+        level = compute_world_level_for_pos(x, y)
+    t = make_mob_template_for_level(level, theme)
     nid = next_npc_id; next_npc_id += 1
     npcs[nid] = {"x": x, "y": y, "dx": 0, "dy": 0, "last_hit_by": None, **t}
     return nid
 
+
+def spawn_boss_at(x: int, y: int, level: int, big: bool = False, theme: str = None):
+    global next_npc_id
+    base = make_mob_template_for_level(level, theme)
+    name = ("Seigneur " if big else "Champion ") + base["name"]
+    hp = int(base["max_hp"] * (4.0 if big else 2.2))
+    dmg = int(base["dmg"] * (2.0 if big else 1.4))
+    nid = next_npc_id; next_npc_id += 1
+    npcs[nid] = {"x": x, "y": y, "dx":0, "dy":0, "name": name, "hp": hp, "max_hp": hp, "hostile": True, "speed": base["speed"], "dmg": dmg, "atk_until": 0, "level": int(level), "is_boss": True, "boss_big": bool(big), "boss_next": now()+3.0}
+    return nid
+
+
 def spawn_villager_npc(x: int, y: int, name: str = None):
     global next_npc_id
     nid = next_npc_id; next_npc_id += 1
-    npcs[nid] = {"x": x, "y": y, "dx": 0, "dy": 0, "name": name or "Villageois", "hp": 1000000, "max_hp": 1000000, "hostile": False, "speed": 0.0, "dmg": 0}
+    npcs[nid] = {"x": x, "y": y, "dx": 0, "dy": 0, "name": name or "Villageois", "hp": 1000000, "max_hp": 1000000, "hostile": False, "speed": 0.0, "dmg": 0, "level": 1}
+    return nid
+
+
+def spawn_merchant_npc(x: int, y: int, merchant_id: str, name: str = None):
+    nid = spawn_villager_npc(x, y, name or merchants_data.get(merchant_id, {}).get("name","Marchand"))
+    npcs[nid]["merchant_id"] = merchant_id
+    return nid
+
+
+def spawn_quest_giver_npc(x: int, y: int, quest_ids: list, name: str = "Quêteur"):
+    nid = spawn_villager_npc(x, y, name)
+    npcs[nid]["quest_ids"] = list(quest_ids)
     return nid
 
 # Items au sol
 items = {}          # iid -> {"x","y","name","type","power":int, ...}
 next_item_id = 1
 
-# Portails / Donjons
-def create_dungeon_area(x0_tile: int, y0_tile: int, w_tiles: int, h_tiles: int):
-    # Placeholder décoratif: on ne modifie pas les tiles dans la version chunkée
-    # Les donjons sont instanciés via téléporteurs (items "portal").
-    for _ in range(6):
-        cx = (x0_tile + 2 + random.randint(0, max(1, w_tiles - 4))) * TILE + TILE // 2
-        cy = (y0_tile + 2 + random.randint(0, max(1, h_tiles - 4))) * TILE + TILE // 2
-        nid = spawn_mob()
-        npcs[nid]["x"] = cx; npcs[nid]["y"] = cy
-
-def spawn_portal_to_dungeon():
-    global next_item_id
-    sx, sy = random_free_pos()
-    x0_tile = random.randint(GRID_W//2, GRID_W-15)
-    y0_tile = random.randint(GRID_H//2, GRID_H-15)
-    create_dungeon_area(x0_tile, y0_tile, 12, 10)
-    dx = x0_tile*TILE + 6*TILE
-    dy = y0_tile*TILE + 5*TILE
-    iid = next_item_id; next_item_id += 1
-    items[iid] = {"x": sx, "y": sy, "name": "Portail instable", "type": "portal", "power": 0, "dest_x": dx, "dest_y": dy}
-    iid2 = next_item_id; next_item_id += 1
-    items[iid2] = {"x": dx, "y": dy, "name": "Portail de sortie", "type": "portal", "power": 0, "dest_x": sx, "dest_y": sy}
+# tour: coordonnées de base des étages (séparées du monde)
+TOWER_BASE_TX = 2000
+TOWER_BASE_TY = 2000
+TOWER_FLOOR_W = 32
+TOWER_FLOOR_H = 24
 
 # Projectiles actifs (sort 1)
 projs = {}          # proj_id -> {"x","y","vx","vy","dmg","owner","expire_at"}
@@ -722,11 +881,16 @@ def handle_client(conn, addr):
                                 if it["type"] == "gold":
                                     p["gold"] += int(it.get("power",1))
                                     sys_msg = {"type":"chat","from":"SYSTEM","msg":f"{p['name']} +{it.get('power',1)} or"}
-                                    # persistance
                                     ident = pid_identity.get(pid)
                                     if ident: mark_dirty(ident["username"])
+                                elif it["type"] == "stairs":
+                                    # passer à l'étage indiqué
+                                    next_floor = int(it.get("floor", 1))
+                                    enter_tower_floor(pid, next_floor)
+                                elif it["type"] == "portal":
+                                    # compat existante
+                                    pass
                                 else:
-                                    # Utiliser un ID d'inventaire indépendant
                                     inv_id = 1000000 + target_iid
                                     inventories[pid].append({"id": inv_id, "name": it["name"], "type": it["type"], "power": it.get("power",0)})
                                     to_send_inv = True
@@ -865,6 +1029,102 @@ def handle_client(conn, addr):
                 elif t == "request_inventory":
                     send_to(pid, {"type":"inventory", "inventory": inventories.get(pid, [])})
 
+                elif t == "get_chunks":
+                    req = data.get("chunks", [])
+                    out = []
+                    with lock:
+                        for ent in req:
+                            cx = int(ent.get("cx")); cy = int(ent.get("cy"))
+                            tiles = get_chunk_with_overrides(cx, cy)
+                            out.append({"cx": cx, "cy": cy, "tiles": tiles})
+                    send_to(pid, {"type":"chunks", "list": out})
+
+                elif t == "interact":
+                    with lock:
+                        p = players.get(pid)
+                        if not p: continue
+                        # cible PNJ la plus proche (amicale)
+                        target = None; best = 999999
+                        for nid, n in npcs.items():
+                            if n.get("hostile", True):
+                                continue
+                            d2 = (n["x"]-p["x"])**2 + (n["y"]-p["y"])**2
+                            if d2 < best and d2 <= (48**2):
+                                best, target = d2, (nid, n)
+                        if not target:
+                            continue
+                        nid, n = target
+                        if n.get("merchant_id"):
+                            mid = n["merchant_id"]
+                            merch = merchants_data.get(mid, {})
+                            send_to(pid, {"type":"merchant_open", "merchant_id": mid, "name": merch.get("name","Marchand"), "stock": merch.get("stock", []), "gold": players[pid].get("gold",0)})
+                        elif n.get("quest_ids"):
+                            qids = list(n.get("quest_ids", []))
+                            char_quests = _get_char_quests(pid)
+                            # assembler statut
+                            lst = []
+                            for qid in qids:
+                                q = quests_data.get(qid) or {}
+                                st = char_quests.get(qid, {"status":"available","progress":{}})
+                                lst.append({"id": qid, "title": q.get("title","?"), "desc": q.get("desc",""), "status": st.get("status","available"), "progress": st.get("progress",{})})
+                            send_to(pid, {"type":"quest_open", "list": lst})
+                        elif n.get("tower_entrance"):
+                            enter_tower_floor(pid, 1)
+
+                elif t == "merchant_buy":
+                    mid = str(data.get("merchant_id",""))
+                    idx = int(data.get("index", -1))
+                    with lock:
+                        stock = (merchants_data.get(mid, {}) or {}).get("stock", [])
+                        if 0 <= idx < len(stock):
+                            entry = stock[idx]
+                            price = int(entry.get("price", 1))
+                            p = players.get(pid)
+                            if p and p.get("gold",0) >= price:
+                                p["gold"] -= price
+                                inv_id = 1000000 + next_item_id; next_item_id += 1
+                                inventories.setdefault(pid, []).append({"id": inv_id, "name": entry.get("name","Objet"), "type": entry.get("type","misc"), "power": int(entry.get("power",0))})
+                                ident = pid_identity.get(pid)
+                                if ident: mark_dirty(ident["username"])
+                                send_to(pid, {"type":"merchant_result","ok":True,"gold":p.get("gold",0)})
+                                send_to(pid, {"type":"inventory", "inventory": inventories.get(pid, [])})
+                            else:
+                                send_to(pid, {"type":"merchant_result","ok":False,"msg":"Pas assez d'or."})
+
+                elif t == "merchant_sell":
+                    iid = data.get("inventory_id")
+                    with lock:
+                        inv = inventories.get(pid, [])
+                        idx = next((i for i,v in enumerate(inv) if str(v.get("id")) == str(iid)), None)
+                        if idx is not None:
+                            obj = inv.pop(idx)
+                            price = max(1, int(obj.get("power",1)) // 2 + (5 if obj.get("type") == "weapon" else 2))
+                            players[pid]["gold"] = players.get(pid, {}).get("gold",0) + price
+                            ident = pid_identity.get(pid)
+                            if ident: mark_dirty(ident["username"])
+                            send_to(pid, {"type":"merchant_result","ok":True,"gold":players[pid].get("gold",0)})
+                            send_to(pid, {"type":"inventory", "inventory": inventories.get(pid, [])})
+
+                elif t == "quest_accept":
+                    qid = str(data.get("quest_id",""))
+                    with lock:
+                        _accept_quest(pid, qid)
+                    send_to(pid, {"type":"quest_updated"})
+
+                elif t == "quest_turnin":
+                    qid = str(data.get("quest_id",""))
+                    with lock:
+                        ok, msg = _turnin_quest(pid, qid)
+                    send_to(pid, {"type":"quest_result", "ok": ok, "msg": msg})
+
+                elif t == "paint_tile":
+                    tx = int(data.get("tx")); ty = int(data.get("ty")); tval = int(data.get("t"))
+                    with lock:
+                        map_overrides[(tx,ty)] = tval
+                        _rebuild_overrides_index(); save_map_overrides()
+                    # réponse immédiate pour feedback
+                    send_to(pid, {"type":"chunks", "list": [{"cx": int(math.floor(tx/CHUNK_TILES)), "cy": int(math.floor(ty/CHUNK_TILES)), "tiles": get_chunk_with_overrides(int(math.floor(tx/CHUNK_TILES)), int(math.floor(ty/CHUNK_TILES)))}]})
+
                 # push l'état à ~20 Hz max
                 broadcast_state()
 
@@ -896,6 +1156,75 @@ def handle_client(conn, addr):
             _cleanup_disconnect(authed_user, pid)
         except Exception:
             pass
+
+# Gestion quêtes côté serveur
+
+def _get_char_quests(pid):
+    ident = pid_identity.get(pid)
+    if not ident:
+        return {}
+    user = accounts["users"].get(ident["username"], {})
+    ch = (user.get("characters", {})).get(str(ident.get("char_id")), {})
+    return ch.setdefault("quests", {})
+
+
+def _accept_quest(pid, qid: str):
+    q = quests_data.get(qid)
+    if not q: return
+    with lock:
+        qs = _get_char_quests(pid)
+        if qid not in qs:
+            qs[qid] = {"status":"active", "progress": {}}
+            ident = pid_identity.get(pid)
+            if ident: mark_dirty(ident["username"])
+
+
+def _inc_quest_kill(pid, mob_name: str):
+    with lock:
+        qs = _get_char_quests(pid)
+        for qid, state in qs.items():
+            if state.get("status") != "active":
+                continue
+            req = (quests_data.get(qid, {})).get("requirements", {}).get("kill", {})
+            for target_name, need in req.items():
+                if target_name in mob_name:
+                    cur = state.setdefault("progress", {}).get(target_name, 0)
+                    state["progress"][target_name] = min(need, cur + 1)
+                    ident = pid_identity.get(pid)
+                    if ident: mark_dirty(ident["username"])
+
+
+def _turnin_quest(pid, qid: str):
+    q = quests_data.get(qid)
+    if not q:
+        return False, "Quête inconnue."
+    with lock:
+        qs = _get_char_quests(pid)
+        st = qs.get(qid)
+        if not st or st.get("status") != "active":
+            return False, "Quête non active."
+        # vérifier progression
+        ok = True
+        req = (q.get("requirements", {})).get("kill", {})
+        for name, need in req.items():
+            if (st.get("progress", {}).get(name, 0)) < int(need):
+                ok = False; break
+        if not ok:
+            return False, "Objectifs non atteints."
+        # récompenser
+        p = players.get(pid)
+        if not p: return False, "Erreur."
+        r = q.get("rewards", {})
+        leveled = grant_xp_gold(p, xp=int(r.get("xp",0)), gold=int(r.get("gold",0)))
+        inv = inventories.get(pid, [])
+        if r.get("item"):
+            global next_item_id
+            inv_id = 1000000 + next_item_id; next_item_id += 1
+            inv.append({"id": inv_id, **r["item"]})
+        qs[qid]["status"] = "done"
+        ident = pid_identity.get(pid)
+        if ident: mark_dirty(ident["username"])
+        return True, "Quête terminée !"
 
 def logic_loop():
     with lock:
@@ -932,20 +1261,22 @@ def logic_loop():
                     elif caster.get("class") == "Voleur": bonus = int(caster.get("stats",{}).get("agi",0)*0.6)
                     n["hp"] -= (p["dmg"] + bonus); n["last_hit_by"] = p["owner"]
                     if n["hp"] <= 0:
-                        # Récompense
-                        owner = players.get(p["owner"]) if p.get("owner") else None
+                        owner_pid = p.get("owner")
+                        owner = players.get(owner_pid) if owner_pid else None
                         if owner:
                             leveled = grant_xp_gold(owner, xp=random.randint(12,22), gold=random.randint(1,3))
-                            ident = pid_identity.get(p["owner"]) if p.get("owner") else None
+                            ident = pid_identity.get(owner_pid) if owner_pid else None
                             if ident: mark_dirty(ident["username"])
+                            # progression quête
+                            _inc_quest_kill(owner_pid, n.get("name","Mob"))
                         drop_loot_at(n["x"], n["y"])
                         del npcs[hit]
                     to_remove.append(pid_)
                     changed = True
             for r in to_remove: projs.pop(r, None)
 
-            # IA mobs
-            for n in npcs.values():
+            # IA mobs + boss attaques spéciales
+            for n in list(npcs.values()):
                 target = None; best = 1e9
                 for p in players.values():
                     if p["dead"]: continue
@@ -959,13 +1290,24 @@ def logic_loop():
                         l = math.hypot(vx, vy) or 1
                         n["x"], n["y"] = move_with_collisions(n["x"], n["y"], (n["speed"]*vx/l), (n["speed"]*vy/l), NPC_SIZE)
                         changed = True
-                    if best <= 28 and now() >= n["atk_until"]:
+                    if best <= 28 and now() >= n.get("atk_until", 0):
                         n["atk_until"] = now() + 1.2
                         target["hp"] -= n.get("dmg", 6)
                         if target["hp"] <= 0 and not target["dead"]:
                             target["dead"] = True
                             target["respawn_at"] = now() + 4.0
                         changed = True
+                # boss: attaque spéciale périodique
+                if n.get("is_boss") and now() >= n.get("boss_next", 0):
+                    n["boss_next"] = now() + (3.5 if n.get("boss_big") else 5.0)
+                    # AoE autour du boss
+                    for p in players.values():
+                        if p["dead"]: continue
+                        if dist(n["x"], n["y"], p["x"], p["y"]) <= (120 if n.get("boss_big") else 90):
+                            p["hp"] -= int(n.get("dmg",10) * (1.5 if n.get("boss_big") else 1.2))
+                            if p["hp"] <= 0 and not p["dead"]:
+                                p["dead"] = True; p["respawn_at"] = now() + 4.0
+                            changed = True
 
             # respawn joueurs + regen
             for p in players.values():
@@ -987,8 +1329,47 @@ def logic_loop():
         if changed:
             broadcast_state()
 
+# Entrée tour et utilitaires
+
+def enter_tower_floor(pid: int, floor: int):
+    if floor < 1: floor = 1
+    if floor > 100: floor = 100
+    ensure_floor_area(floor)
+    with lock:
+        p = players.get(pid)
+        if not p: return
+        tx0 = TOWER_BASE_TX + floor * (TOWER_FLOOR_W + 8)
+        ty0 = TOWER_BASE_TY
+        p["x"] = (tx0+2)*TILE + TILE//2
+        p["y"] = (ty0+TOWER_FLOOR_H-3)*TILE + TILE//2
+        p["tower_floor"] = floor
+        ident = pid_identity.get(pid)
+        if ident: mark_dirty(ident["username"])
+        # envoyer quelques chunks immédiatement pour éviter écran vide
+        cx0 = int(math.floor((tx0+TOWER_FLOOR_W//2)/CHUNK_TILES))
+        cy0 = int(math.floor((ty0+TOWER_FLOOR_H//2)/CHUNK_TILES))
+        lst = []
+        for dy in range(-1,2):
+            for dx in range(-1,2):
+                cx = cx0+dx; cy = cy0+dy
+                lst.append({"cx": cx, "cy": cy, "tiles": get_chunk_with_overrides(cx, cy)})
+        send_to(pid, {"type":"chunks","list":lst})
+        broadcast_state()
+
 def start_server():
     load_accounts()
+    _ensure_default_files()
+    load_merchants(); load_quests(); load_map_overrides()
+    # assurer village + tour
+    ensure_starting_village(); ensure_tower_entrance(); save_map_overrides()
+    # PNJ marchands et donneur de quêtes
+    # positions village (en px)
+    spawn_merchant_npc(-8*TILE, -2*TILE, "weaponsmith")
+    spawn_merchant_npc(6*TILE, -2*TILE, "alchemist")
+    spawn_quest_giver_npc(0, 6*TILE, [k for k in list(quests_data.keys())[:2]], name="Intendante du village")
+    # gardien de la tour (entrée)
+    guard_id = spawn_villager_npc(0, 0, name="Gardien de la tour")
+    npcs[guard_id]["tower_entrance"] = True
     threading.Thread(target=saver_loop, daemon=True).start()
     threading.Thread(target=logic_loop, daemon=True).start()
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -999,8 +1380,6 @@ def start_server():
         conn, addr = s.accept()  # pas de timeout client
         threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 
-if __name__ == "__main__":
-    start_server()
 
 
 def _cleanup_disconnect(authed_user, pid):
@@ -1015,3 +1394,91 @@ def _cleanup_disconnect(authed_user, pid):
         if pid in inventories: inventories.pop(pid, None)
         if pid in cooldowns: cooldowns.pop(pid, None)
         if pid in pid_identity: pid_identity.pop(pid, None)
+
+# helpers: overrides & simple structure carving
+
+def carve_rect(tx0: int, ty0: int, w: int, h: int, tile_val: int):
+    for ty in range(ty0, ty0+h):
+        for tx in range(tx0, tx0+w):
+            map_overrides[(tx, ty)] = int(tile_val)
+    _rebuild_overrides_index()
+
+
+def ensure_starting_village():
+    # Village autour du centre (place sable + routes + quelques maisons)
+    tx0, ty0 = -16, -12
+    w, h = 34, 26
+    carve_rect(tx0, ty0, w, h, 3)  # place
+    # routes cardinales
+    for x in range(tx0, tx0+w):
+        map_overrides[(x, 0)] = 4
+        map_overrides[(x, -1)] = 4
+    for y in range(ty0, ty0+h):
+        map_overrides[(0, y)] = 4
+        map_overrides[(1, y)] = 4
+    # maisons rectangles de murs
+    for bx, by in [(-12,-8), (10,-6), (-6,6), (8,8)]:
+        for x in range(bx, bx+6):
+            map_overrides[(x, by)] = 1
+            map_overrides[(x, by+4)] = 1
+        for y in range(by, by+5):
+            map_overrides[(bx, y)] = 1
+            map_overrides[(bx+5, y)] = 1
+    _rebuild_overrides_index()
+
+
+def ensure_tower_entrance():
+    # Petite base pavée au centre comme entrée de tour
+    carve_rect(-4, -4, 8, 8, 4)
+
+
+def floor_theme(floor: int) -> str:
+    idx = ((floor-1)//10) % 5
+    return ["slime","gob","wolf","orc","bear"][idx]
+
+
+def floor_monster_theme(theme: str) -> str:
+    return {"slime":"slime","gob":"gob","wolf":"wolf","orc":"orc","bear":"bear"}.get(theme)
+
+
+def ensure_floor_area(floor: int):
+    # génère un étage rectangulaire clos dans une zone dédiée
+    theme = floor_theme(floor)
+    tx0 = TOWER_BASE_TX + floor * (TOWER_FLOOR_W + 8)
+    ty0 = TOWER_BASE_TY
+    base_tile = 3 if theme in ("gob","orc") else 0
+    carve_rect(tx0, ty0, TOWER_FLOOR_W, TOWER_FLOOR_H, base_tile)
+    # murs
+    for x in range(tx0, tx0+TOWER_FLOOR_W):
+        map_overrides[(x, ty0)] = 1
+        map_overrides[(x, ty0+TOWER_FLOOR_H-1)] = 1
+    for y in range(ty0, ty0+TOWER_FLOOR_H):
+        map_overrides[(tx0, y)] = 1
+        map_overrides[(tx0+TOWER_FLOOR_W-1, y)] = 1
+    _rebuild_overrides_index(); save_map_overrides()
+    # peupler
+    center_x = (tx0 + TOWER_FLOOR_W//2) * TILE + TILE//2
+    center_y = (ty0 + TOWER_FLOOR_H//2) * TILE + TILE//2
+    for _ in range(8):
+        sx = (tx0+2 + random.randint(0, TOWER_FLOOR_W-4)) * TILE + TILE//2
+        sy = (ty0+2 + random.randint(0, TOWER_FLOOR_H-4)) * TILE + TILE//2
+        spawn_mob_at(sx, sy, level=floor, theme=floor_monster_theme(theme))
+    if floor % 10 == 0:
+        spawn_boss_at(center_x, center_y, level=floor+2, big=True, theme=floor_monster_theme(theme))
+    elif floor % 5 == 0:
+        spawn_boss_at(center_x, center_y, level=floor+1, big=False, theme=floor_monster_theme(theme))
+    # escalier vers l'étage suivant
+    global next_item_id
+    iid = next_item_id; next_item_id += 1
+    items[iid] = {"x": (tx0+TOWER_FLOOR_W-3)*TILE, "y": (ty0+2)*TILE, "name": "Escalier", "type": "stairs", "power": 0, "floor": floor+1}
+
+
+def spawn_portal_to_dungeon():
+    # Compat: simple no-op spawn d'un jeton décoratif
+    global next_item_id
+    x, y = random_free_pos()
+    iid = next_item_id; next_item_id += 1
+    items[iid] = {"x": x, "y": y, "name": "Portail instable", "type": "gold", "power": 1}
+
+if __name__ == "__main__":
+    start_server()

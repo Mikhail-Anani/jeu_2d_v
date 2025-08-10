@@ -1,0 +1,14 @@
+{
+  "q_slimes_5": {
+    "title": "Nettoyage gluant",
+    "desc": "Éliminer 5 Slimes près du village.",
+    "requirements": {"kill": {"Slime": 5}},
+    "rewards": {"xp": 60, "gold": 20}
+  },
+  "q_gobs_3": {
+    "title": "Tapage gobelin",
+    "desc": "Tuer 3 Gobelins.",
+    "requirements": {"kill": {"Gobelin": 3}},
+    "rewards": {"xp": 80, "gold": 25}
+  }
+}

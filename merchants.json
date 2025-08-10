@@ -1,0 +1,18 @@
+{
+  "weaponsmith": {
+    "name": "Marchand d'armes",
+    "stock": [
+      {"name": "Épée rouillée", "type": "weapon", "power": 5, "price": 20},
+      {"name": "Hache légère", "type": "weapon", "power": 8, "price": 45},
+      {"name": "Arc court", "type": "weapon", "power": 7, "price": 38}
+    ]
+  },
+  "alchemist": {
+    "name": "Alchimiste",
+    "stock": [
+      {"name": "Petite potion", "type": "potion", "power": 30, "price": 10},
+      {"name": "Potion de mana", "type": "scroll", "power": 25, "price": 14},
+      {"name": "Tonique fortifiant", "type": "potion", "power": 50, "price": 25}
+    ]
+  }
+}
