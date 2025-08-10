@@ -583,7 +583,7 @@ while running:
             if UI_STATE == "select":
                 if event.key == pygame.K_r:
                     send_json(sock, {"type":"request_characters"})
-                elif event.key == pygame.K_n:
+                elif event.key == pygame.K_c:
                     create_name = ""; create_class_idx = 0; create_msg = ""
                     UI_STATE = "create"
                 elif event.key == pygame.K_UP:
