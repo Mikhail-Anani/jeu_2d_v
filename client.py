@@ -42,6 +42,11 @@ slot_rects = {}
 
 chat_log = []; chat_typing = False; chat_buffer = ""
 
+# Système de quêtes et dialogues
+current_dialogue = None  # {"type": "merchant/quest/npc", "data": {...}}
+player_quests = []       # Quêtes actives du joueur
+quest_ui_open = False
+
 # ---- Config & keybindings ----
 DEFAULT_KEYS = {
     "move_up": "K_z", "move_left": "K_q", "move_down": "K_s", "move_right": "K_d",
@@ -163,6 +168,17 @@ def network_thread(sock):
                     requested_chunks.discard((cx,cy))
             elif t == "inventory":
                 inventory = data.get("inventory", inventory)
+            elif t == "merchant_dialogue":
+                current_dialogue = {"type": "merchant", "data": data}
+            elif t == "quest_dialogue":
+                current_dialogue = {"type": "quest", "data": data}
+            elif t == "npc_dialogue":
+                current_dialogue = {"type": "npc", "data": data}
+            elif t == "tower_entered":
+                floor = data.get("floor", 1)
+                message = data.get("message", f"Étage {floor}")
+                chat_log.append(f"[TOUR] {message}")
+                if len(chat_log) > 100: chat_log.pop(0)
             elif t == "chat":
                 chat_log.append((data.get("from","?"), data.get("msg",""))); 
                 if len(chat_log) > 60: del chat_log[0]
@@ -333,9 +349,113 @@ def draw_npc(nid, info):
     hp_ratio = (info.get("hp",0) / mhp) if mhp > 0 else None
     name = info.get("name","PNJ")
     sprite_mob(name, sx, sy, True, hp_ratio)
-    if not info.get("hostile", True):
+    
+    # Afficher nom et niveau au-dessus
+    if info.get("hostile", True):  # Monstres hostiles
+        level = info.get("level", 1)
+        display_name = f"{name} Niv.{level}"
+        color = (255, 100, 100) if info.get("is_boss") else (255, 255, 100)
+    else:  # NPCs amicaux
+        display_name = name
+        color = (100, 255, 100)
         # icône PNJ
         pygame.draw.circle(screen, (240,220,90), (int(sx), int(sy-16)), 3)
+    
+    # Affichage du texte
+    text_surface = font.render(display_name, True, color)
+    text_rect = text_surface.get_rect(center=(int(sx), int(sy-30)))
+    # Fond semi-transparent pour la lisibilité
+    pygame.draw.rect(screen, (0, 0, 0, 128), text_rect.inflate(4, 2))
+    screen.blit(text_surface, text_rect)
+
+def draw_dialogue():
+    """Affiche les dialogues avec NPCs, marchands et quêtes"""
+    if not current_dialogue:
+        return
+    
+    dialogue_type = current_dialogue["type"]
+    data = current_dialogue["data"]
+    
+    # Fenêtre de dialogue au centre
+    dialog_w, dialog_h = 600, 400
+    dialog_x = (WIDTH - dialog_w) // 2
+    dialog_y = (HEIGHT - dialog_h) // 2
+    
+    # Fond du dialogue
+    pygame.draw.rect(screen, (20, 20, 25), (dialog_x, dialog_y, dialog_w, dialog_h))
+    pygame.draw.rect(screen, (100, 100, 120), (dialog_x, dialog_y, dialog_w, dialog_h), 3)
+    
+    # Titre
+    npc_name = data.get("npc_name", "PNJ")
+    title_text = bigfont.render(f"Dialogue avec {npc_name}", True, (255, 255, 255))
+    screen.blit(title_text, (dialog_x + 20, dialog_y + 10))
+    
+    # Bouton fermer
+    close_btn_rect = pygame.Rect(dialog_x + dialog_w - 30, dialog_y + 10, 20, 20)
+    pygame.draw.rect(screen, (150, 50, 50), close_btn_rect)
+    screen.blit(font.render("X", True, (255, 255, 255)), (close_btn_rect.x + 6, close_btn_rect.y + 2))
+    
+    if dialogue_type == "merchant":
+        # Interface marchand
+        merchant_type = data.get("merchant_type", "")
+        merchant_inv = data.get("inventory", [])
+        
+        y_offset = dialog_y + 50
+        screen.blit(font.render("Marchandises disponibles:", True, (200, 200, 200)), (dialog_x + 20, y_offset))
+        
+        for i, item in enumerate(merchant_inv[:10]):  # Limite à 10 items
+            y_pos = y_offset + 30 + i * 25
+            item_name = item.get("name", "Item")
+            item_price = item.get("price", 0)
+            stock = item.get("stock", 0)
+            
+            color = (255, 255, 255) if stock > 0 else (100, 100, 100)
+            item_text = f"{item_name} - {item_price} or (Stock: {stock})"
+            screen.blit(font.render(item_text, True, color), (dialog_x + 40, y_pos))
+    
+    elif dialogue_type == "quest":
+        # Interface quêtes
+        available_quests = data.get("available_quests", [])
+        
+        y_offset = dialog_y + 50
+        screen.blit(font.render("Quêtes disponibles:", True, (200, 200, 200)), (dialog_x + 20, y_offset))
+        
+        for i, quest in enumerate(available_quests[:8]):  # Limite à 8 quêtes
+            y_pos = y_offset + 30 + i * 40
+            quest_name = quest.get("name", "Quête")
+            quest_desc = quest.get("description", "")
+            
+            screen.blit(font.render(quest_name, True, (255, 255, 100)), (dialog_x + 40, y_pos))
+            screen.blit(font.render(quest_desc[:60], True, (200, 200, 200)), (dialog_x + 40, y_pos + 15))
+    
+    elif dialogue_type == "npc":
+        # Dialogue simple
+        message = data.get("message", "Bonjour !")
+        y_offset = dialog_y + 50
+        
+        # Affichage du message avec retour à la ligne automatique
+        words = message.split()
+        lines = []
+        current_line = ""
+        
+        for word in words:
+            test_line = current_line + word + " "
+            if font.size(test_line)[0] < dialog_w - 80:
+                current_line = test_line
+            else:
+                if current_line:
+                    lines.append(current_line.strip())
+                current_line = word + " "
+        
+        if current_line:
+            lines.append(current_line.strip())
+        
+        for i, line in enumerate(lines):
+            screen.blit(font.render(line, True, (255, 255, 255)), (dialog_x + 40, y_offset + i * 25))
+    
+    # Instructions
+    instruction_y = dialog_y + dialog_h - 30
+    screen.blit(font.render("Appuyez sur Échap pour fermer", True, (150, 150, 150)), (dialog_x + 20, instruction_y))
 
 def draw_inventory():
     s = {"large":1.0, "medium":0.8, "hidden":0.0}.get(HUD_SCALE, 1.0)
@@ -583,7 +703,7 @@ while running:
             if UI_STATE == "select":
                 if event.key == pygame.K_r:
                     send_json(sock, {"type":"request_characters"})
-                elif event.key == pygame.K_n:
+                elif event.key == pygame.K_c:
                     create_name = ""; create_class_idx = 0; create_msg = ""
                     UI_STATE = "create"
                 elif event.key == pygame.K_UP:
@@ -619,11 +739,18 @@ while running:
                         create_name += ch
                 continue
 
-            # En jeu: options et commandes
-            if key_is(event.key, "options") or event.key == pygame.K_ESCAPE:
-                if OPTIONS_OPEN and waiting_bind:
+            # En jeu: dialogues et options
+            if event.key == pygame.K_ESCAPE:
+                if current_dialogue:
+                    current_dialogue = None
+                    continue
+                elif OPTIONS_OPEN and waiting_bind:
                     waiting_bind = False
                 else:
+                    OPTIONS_OPEN = not OPTIONS_OPEN
+                continue
+            elif key_is(event.key, "options"):
+                if not current_dialogue:
                     OPTIONS_OPEN = not OPTIONS_OPEN
                 continue
             if key_is(event.key, "hud_toggle"):
@@ -892,6 +1019,9 @@ while running:
         screen.blit(bigfont.render(f"← {cls} →", True, (230,230,230)), (x+100, y+140))
         if create_msg:
             screen.blit(font.render(create_msg, True, (240,200,120)), (x+16, y+h-28))
+
+    # Afficher les dialogues par-dessus tout
+    draw_dialogue()
 
     pygame.display.flip()
     # tooltip render

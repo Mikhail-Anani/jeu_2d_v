@@ -1,0 +1,29 @@
+{
+  "weapon_merchant": {
+    "name": "Forgeron Thorek",
+    "type": "weapons",
+    "inventory": [
+      {"name": "Épée de fer", "type": "weapon", "stats": {"str": 5, "dmg": 15}, "price": 50, "stock": 10},
+      {"name": "Hache de guerre", "type": "weapon", "stats": {"str": 8, "dmg": 20}, "price": 80, "stock": 5},
+      {"name": "Dague empoisonnée", "type": "weapon", "stats": {"agi": 6, "dmg": 12}, "price": 60, "stock": 8},
+      {"name": "Bâton magique", "type": "weapon", "stats": {"int": 7, "dmg": 18}, "price": 75, "stock": 6},
+      {"name": "Arc long", "type": "weapon", "stats": {"agi": 5, "dmg": 16}, "price": 65, "stock": 7},
+      {"name": "Bouclier de fer", "type": "shield", "stats": {"def": 10}, "price": 40, "stock": 12},
+      {"name": "Armure de cuir", "type": "armor", "stats": {"def": 8, "hp": 20}, "price": 70, "stock": 8}
+    ]
+  },
+  "alchemist": {
+    "name": "Alchimiste Zelda",
+    "type": "potions",
+    "inventory": [
+      {"name": "Potion de soin", "type": "consumable", "effect": {"heal": 50}, "price": 15, "stock": 20},
+      {"name": "Potion de mana", "type": "consumable", "effect": {"mana": 40}, "price": 12, "stock": 18},
+      {"name": "Potion de force", "type": "consumable", "effect": {"str_boost": 5, "duration": 300}, "price": 25, "stock": 10},
+      {"name": "Potion d'agilité", "type": "consumable", "effect": {"agi_boost": 5, "duration": 300}, "price": 25, "stock": 10},
+      {"name": "Potion d'intelligence", "type": "consumable", "effect": {"int_boost": 5, "duration": 300}, "price": 25, "stock": 10},
+      {"name": "Antidote", "type": "consumable", "effect": {"cure_poison": true}, "price": 20, "stock": 15},
+      {"name": "Élixir de résurrection", "type": "consumable", "effect": {"revive": true}, "price": 100, "stock": 3},
+      {"name": "Bombes explosives", "type": "consumable", "effect": {"damage": 80, "radius": 60}, "price": 35, "stock": 8}
+    ]
+  }
+}
